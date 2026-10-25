@@ -37,11 +37,14 @@ exact total on the approval page, and the bot only says "ordered" once Grubhub r
    `GRUBHUB_MAX_ORDER_MINOR`, `GRUBHUB_SESSION_DIR`, `GRUBHUB_CHECKOUT_ENABLED`). Needs `uv` installed.
 2. Sign in the shared session once (search and menus):
    `corepack pnpm --filter @campus/grubhub login` (one-time code by email).
-3. Sign in **each person who orders**, once:
-   `corepack pnpm --filter @campus/grubhub login -- --user <their userId>`. Their userId is shown on their
-   `/me` page ("Ordering food") and is their row in `core.users`. Their account needs the delivery address and a **plain credit or
-   debit card** saved in the Grubhub app: Apple Pay, Google Pay, PayPal, Venmo and gift cards can't be
-   used (Apple Pay needs Face ID on their phone), and expired cards are skipped.
+3. **Each person who orders connects their own account once, from their 1:1 chat:** they text the
+   assistant "connect grubhub", reply with their Grubhub email, then reply with the code Grubhub
+   emails them. No password is asked for; the email and code never reach the model and aren't saved
+   to memory. A group order whose payer isn't connected DMs them this automatically. (Admin
+   alternative: `corepack pnpm --filter @campus/grubhub login -- --user <their userId>`; the userId
+   is on their `/me` page.) Their account needs the delivery address and a **plain credit or debit
+   card** saved in the Grubhub app: Apple Pay, Google Pay, PayPal, Venmo and gift cards can't be used
+   (Apple Pay needs Face ID on their phone), and expired cards are skipped.
 
 Sessions are saved in `.data/grubhub` (the shared one at the root, each person's in
 `users/<userId>/`). They contain credentials: never commit or share them.

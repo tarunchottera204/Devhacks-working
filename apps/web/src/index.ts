@@ -320,8 +320,8 @@ async function poll() {
       <div class="card">
         <h2>Ordering food</h2>
         <p class="small muted">
-          Orders are placed on your own Grubhub account. To connect it, the admin signs it in with your user
-          id: <code>${s.userId}</code>
+          Orders are placed on your own Grubhub account. To connect it, text the assistant "connect grubhub".
+          Your user id: <code>${s.userId}</code>
         </p>
       </div>
       <div class="card">

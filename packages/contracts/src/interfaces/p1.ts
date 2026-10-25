@@ -173,6 +173,8 @@ export type AgentTurnResult = {
   replies: string[];
   /** Consent-checked by MemoryPolicy before ingestion (step 12). */
   memoryCandidates: MemoryCandidate[];
+  /** Don't ingest the person's own message into memory (e.g. a reply in an account sign-in). */
+  skipMessageMemory?: boolean;
   status?: "ok" | "budget_exhausted" | "failed_safe";
   detail?: Record<string, unknown>;
 };

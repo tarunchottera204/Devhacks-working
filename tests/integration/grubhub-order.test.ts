@@ -68,6 +68,9 @@ function fakeGrubhub() {
     /** What cart_checkout does: answer with an order id, or throw like a timeout. */
     checkout: (): unknown => ({ order_id: "GH-777" }),
     lastCart: "",
+    /** The code Grubhub "emails" when someone signs in from chat. */
+    loginCode: "123456",
+    hasCard: true,
   };
   const make =
     (user: string | null) =>
@@ -121,7 +124,16 @@ function fakeGrubhub() {
                 },
           };
         }
+        case "send_login_otp":
+          if (String(args.email).startsWith("nobody"))
+            throw new Error("grubhub send_login_otp: unknown email");
+          return { ok: true };
+        case "verify_login_otp":
+          if (args.code !== state.loginCode) throw new Error("grubhub verify_login_otp: invalid code");
+          state.signedIn.add(user!);
+          return { ok: true };
         case "get_payment_methods":
+          if (!state.hasCard) return [{ id: "pm-apple", type: "APPLE_PAY", default: true }];
           return [
             { id: "pm-apple", type: "APPLE_PAY", default: true },
             {
@@ -145,6 +157,7 @@ function fakeGrubhub() {
     overrides: {
       diningCaller: make(null),
       diningCallerFor: (userId: string) => (state.signedIn.has(userId) ? make(userId) : null),
+      diningLoginFor: (userId: string) => make(userId),
     },
   };
 }
@@ -357,7 +370,7 @@ describe("group order: the requester pays on their own Grubhub account", () => {
     expect(groupTexts().some((x) => x.startsWith("Order placed"))).toBe(false);
   });
 
-  it("the requester has no Grubhub account → the group is told; nothing is quoted or asked", async () => {
+  it("the requester has no Grubhub account → the group is told; nothing is quoted or charged", async () => {
     await start();
     gh.state.signedIn.delete(AVERY.userId);
     const confirm = await planAndConfirm();
@@ -365,7 +378,10 @@ describe("group order: the requester pays on their own Grubhub account", () => {
       "Avery needs to connect a Grubhub account before I can order on it. Nothing was ordered.",
     );
     expect(accountCalls("cart_new")).toEqual([]);
-    expect(confirm.sent.some((m) => m.kind === "dm")).toBe(false);
+    // The only DM is the sign-in ask to Avery; no payment link to anyone.
+    const dms = confirm.sent.filter((m) => m.kind === "dm");
+    expect(dms.map((m) => m.to)).toEqual([AVERY.externalId]);
+    expect(dms[0]!.text).not.toMatch(/approve/);
   });
 
   it("refuses to place the order if the provider's total changed after everyone agreed", async () => {
@@ -454,5 +470,92 @@ describe("personal order (1:1 chat) on the person's own account", () => {
       "Taco Bell is preparing the order.",
     ]);
     expect(accountCalls("track_order").map((c) => c.user)).toEqual([BLAKE.userId]);
+  });
+});
+
+describe("connecting your own Grubhub account from your 1:1 chat", () => {
+  const dmTo = (t: { sent: Array<{ kind: string; to: string; text: string }> }, who: string) =>
+    t.sent.filter((m) => m.kind === "dm" && m.to === who).map((m) => m.text);
+
+  it("'connect grubhub' → email → emailed code → connected; no model call, nothing remembered", async () => {
+    await start();
+    gh.state.signedIn.delete(BLAKE.userId);
+    const ask = await sim.dm(BLAKE.externalId, "can you connect my grubhub account?");
+    expect(dmTo(ask, BLAKE.externalId)[0]).toMatch(
+      /reply here with the email you use for Grubhub.*never need your password/,
+    );
+
+    const email = await sim.dm(BLAKE.externalId, "blake.k@example.com");
+    expect(dmTo(email, BLAKE.externalId)).toEqual([
+      "Grubhub just emailed a sign-in code to blake.k@example.com. Reply here with the code.",
+    ]);
+    expect(accountCalls("send_login_otp")).toEqual([
+      { user: BLAKE.userId, tool: "send_login_otp", args: { email: "blake.k@example.com" } },
+    ]);
+
+    const wrong = await sim.dm(BLAKE.externalId, "000000");
+    expect(dmTo(wrong, BLAKE.externalId)[0]).toMatch(/^That code didn't work/);
+    const ok = await sim.dm(BLAKE.externalId, "123 456");
+    expect(dmTo(ok, BLAKE.externalId)[0]).toMatch(/^Connected! Your Grubhub account is linked/);
+    expect(gh.state.signedIn.has(BLAKE.userId)).toBe(true);
+    expect(accountCalls("verify_login_otp").at(-1)).toMatchObject({
+      user: BLAKE.userId,
+      args: { email: "blake.k@example.com", code: "123456" },
+    });
+
+    // The email and code never reached the model or memory.
+    expect(sim.c.fakes.model!.allPromptText()).not.toMatch(/blake\.k@example\.com|123 ?456/);
+    expect(JSON.stringify(sim.c.fakes.memoryStore!.writes)).not.toMatch(/blake\.k@example\.com/);
+    // The finished sign-in forgets the email.
+    const tasks = await sim.c.tasks.listByStatus("dining_account_link", ["connected"]);
+    expect(tasks.map((t) => t.state)).toEqual([{}]);
+  });
+
+  it("email in the first message; warns when there's no usable saved card", async () => {
+    await start();
+    gh.state.signedIn.delete(BLAKE.userId);
+    gh.state.hasCard = false;
+    const t = await sim.dm(BLAKE.externalId, "connect grubhub, it's blake.k@example.com");
+    expect(dmTo(t, BLAKE.externalId)[0]).toMatch(/^Grubhub just emailed a sign-in code/);
+    const ok = await sim.dm(BLAKE.externalId, "123456");
+    expect(dmTo(ok, BLAKE.externalId)[0]).toMatch(/don't see a credit or debit card saved on it/);
+  });
+
+  it("a refused email, 'cancel', and three wrong codes all end safely", async () => {
+    await start();
+    gh.state.signedIn.delete(BLAKE.userId);
+    await sim.dm(BLAKE.externalId, "link my grubhub");
+    const bad = await sim.dm(BLAKE.externalId, "nobody@example.com");
+    expect(dmTo(bad, BLAKE.externalId)[0]).toMatch(/^Grubhub didn't accept that email/);
+    const cancel = await sim.dm(BLAKE.externalId, "cancel");
+    expect(dmTo(cancel, BLAKE.externalId)).toEqual(["Okay, I won't connect Grubhub."]);
+
+    await sim.dm(BLAKE.externalId, "connect grubhub blake.k@example.com");
+    await sim.dm(BLAKE.externalId, "111111");
+    await sim.dm(BLAKE.externalId, "222222");
+    const third = await sim.dm(BLAKE.externalId, "333333");
+    expect(dmTo(third, BLAKE.externalId)[0]).toMatch(
+      /so I stopped\. Text me "connect grubhub" to start over/,
+    );
+    expect(gh.state.signedIn.has(BLAKE.userId)).toBe(false);
+    // Afterwards a number is just a message for the agent again.
+    const after = await sim.dm(BLAKE.externalId, "123456");
+    expect(after.outcomes[0]!.detail).not.toEqual({ intent: "account_link" });
+  });
+
+  it("group order whose payer isn't connected: the payer is asked privately, connects, and can order", async () => {
+    await start();
+    gh.state.signedIn.delete(AVERY.userId);
+    const confirm = await planAndConfirm();
+    expect(lastGroup(confirm)).toMatch(/Avery needs to connect a Grubhub account.*Avery, I texted you how/);
+    expect(dmTo(confirm, AVERY.externalId)[0]).toMatch(/reply here with the email you use for Grubhub/);
+
+    await sim.dm(AVERY.externalId, "avery@example.com");
+    const ok = await sim.dm(AVERY.externalId, "123456");
+    expect(dmTo(ok, AVERY.externalId)[0]).toMatch(/^Connected!/);
+
+    await planAndConfirm();
+    expect((await task()).status).toBe("awaiting_confirmations");
+    expect(accountCalls("cart_new").map((c) => c.user)).toEqual([AVERY.userId]);
   });
 });

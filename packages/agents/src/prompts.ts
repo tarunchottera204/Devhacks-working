@@ -8,7 +8,7 @@ If something needs their approval, the system will ask them; just tell them you 
 If they ask you to always allow or stop asking for something, propose a permission_change rather than promising it.
 To order food for them: find places with dining__search_options, read the menu with dining__get_menu, then call dining__quote_order with the items they want and tell them the exact total (tax and fees included).
 Only call dining__submit_order (with that cartId and exactly that totalMinor) after they tell you to place it. It is paid with the card saved on their own Grubhub account, and they approve the payment privately first. Never say it's ordered until they've approved it and it was placed.
-If a quote says account_not_connected, tell them to connect their Grubhub account first.`;
+If they want to connect their Grubhub account, or a quote says account_not_connected, tell them to text "connect grubhub" (the system then signs them in with a code Grubhub emails them; never ask for their password).`;
 }
 
 export function groupSystemPrompt(agentName: string): string {

@@ -2,6 +2,8 @@ import {
   DeterministicCoordinator,
   GroupAgentRegistry,
   InProcessCoordinationBus,
+  AccountLinkFlow,
+  type DiningAccounts,
   OrderService,
   PersonalAgentRegistry,
   type QuotedCart,
@@ -76,6 +78,7 @@ import {
   type GrubhubCallerFor,
   GrubhubProcess,
   createGrubhubDining,
+  savedCard,
 } from "@campus/grubhub";
 import {
   AgentRuntimeImpl,
@@ -150,6 +153,8 @@ export type ContainerOverrides = Partial<
     diningCaller: GrubhubCaller;
     /** Tests: each person's own fake Grubhub account (null = not signed in). */
     diningCallerFor: GrubhubCallerFor;
+    /** Tests: the fake Grubhub a person signs in on (send/verify the emailed code). */
+    diningLoginFor: (userId: string) => GrubhubCaller;
   }
 >;
 
@@ -297,6 +302,7 @@ export async function buildContainer(
     permissions: PermissionResolver,
     connections: ConnectionService;
   let describeCart: ((cartId: string) => QuotedCart | null) | undefined;
+  let diningAccounts: DiningAccounts | undefined;
   let spendAware: SpendAwareApprovals | null = null;
   if (config.USE_REAL_TOOLS) {
     approvals = await loadReal<ApprovalService>("approvals", moduleDeps);
@@ -320,10 +326,30 @@ export async function buildContainer(
         closers.push(() => gh.close());
         call = gh.call;
       }
+      let loginFor = o.diningLoginFor;
       if (!callFor && !o.diningCaller) {
         const accounts = new GrubhubAccounts({ sessionDir: config.GRUBHUB_SESSION_DIR, logger });
         closers.push(() => accounts.close());
         callFor = accounts.forUser;
+        loginFor = accounts.loginCaller;
+      }
+      // People connect their own account from their 1:1 chat ("connect grubhub" → emailed code).
+      if (callFor && loginFor) {
+        const accountFor = callFor;
+        const login = loginFor;
+        diningAccounts = {
+          provider: "Grubhub",
+          isConnected: (userId) => accountFor(userId) !== null,
+          sendCode: async (userId, email) => {
+            await login(userId)("send_login_otp", { email });
+          },
+          verifyCode: async (userId, email, code) => {
+            const gh = login(userId);
+            await gh("verify_login_otp", { email, code });
+            const payments = await gh("get_payment_methods", {}).catch(() => undefined);
+            return { hasCard: payments === undefined ? null : savedCard(payments) !== null };
+          },
+        };
       }
       const dining = createGrubhubDining({
         call,
@@ -408,7 +434,11 @@ export async function buildContainer(
   });
 
   const names = invocationNames(config);
+  const accountLink = diningAccounts
+    ? new AccountLinkFlow({ tasks, accounts: diningAccounts, audit, clock, logger })
+    : undefined;
   const personalAgents = new PersonalAgentRegistry({
+    ...(accountLink ? { accountLink } : {}),
     runtime,
     broker,
     memoryStore,
@@ -440,6 +470,7 @@ export async function buildContainer(
     agentName: config.AGENT_DISPLAY_NAME,
     invocationHint: names[0] ?? "agent",
     optionsTool: config.GROUP_MEAL_OPTIONS_TOOL,
+    ...(accountLink ? { accountLink } : {}),
   });
 
   // Real orders, group and personal (payer approval → place → tracking). Scheduled with the memory jobs.

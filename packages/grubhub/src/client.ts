@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HarnessError, type Logger } from "@campus/contracts";
@@ -140,8 +140,9 @@ export function userSessionDir(sessionDir: string, userId: string): string {
 export type GrubhubCallerFor = (userId: string) => GrubhubCaller | null;
 
 /**
- * Each person's own Grubhub account: one grubhub-mcp process per person who has signed in (with
- * `pnpm --filter @campus/grubhub login -- --user <userId>`), started on first use.
+ * Each person's own Grubhub account: one grubhub-mcp process per person, started on first use. They
+ * sign in by texting the assistant "connect grubhub" (email one-time code), or with
+ * `pnpm --filter @campus/grubhub login -- --user <userId>`.
  */
 export class GrubhubAccounts {
   private readonly processes = new Map<string, GrubhubProcess>();
@@ -151,14 +152,24 @@ export class GrubhubAccounts {
 
   readonly forUser: GrubhubCallerFor = (userId) => {
     const dir = userSessionDir(this.opts.sessionDir, userId);
-    if (!existsSync(join(dir, SESSION_FILE))) return null;
+    return existsSync(join(dir, SESSION_FILE)) ? this.processFor(userId, dir).call : null;
+  };
+
+  /** A process on the person's own session dir even before they've signed in: for the login calls. */
+  readonly loginCaller = (userId: string): GrubhubCaller => {
+    const dir = userSessionDir(this.opts.sessionDir, userId);
+    mkdirSync(dir, { recursive: true });
+    return this.processFor(userId, dir).call;
+  };
+
+  private processFor(userId: string, dir: string): GrubhubProcess {
     let p = this.processes.get(userId);
     if (!p) {
       p = new GrubhubProcess({ ...this.opts, sessionDir: dir });
       this.processes.set(userId, p);
     }
-    return p.call;
-  };
+    return p;
+  }
 
   async close(): Promise<void> {
     const all = [...this.processes.values()];

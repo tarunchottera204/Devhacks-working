@@ -127,8 +127,10 @@ run on **each person's own Grubhub account**, paid with the plain card saved the
   closed). Grubhub 4xx = not placed; timeout/5xx/no order id = outcome unknown
   (`needs_reconciliation`). Verifying it needs a HAR of one real checkout; see the Grubhub README.
   **Never run checkout live without the account owner's explicit OK.**
-- Each person signs in once: `corepack pnpm --filter @campus/grubhub login -- --user <userId>`
-  (userId is shown on `/me`).
+- Each person connects once by texting the assistant "connect grubhub" (email → emailed code;
+  `AccountLinkFlow`, deterministic, no model, kept out of memory via `skipMessageMemory`). A group
+  order whose payer isn't connected DMs them the same ask. Admin fallback:
+  `corepack pnpm --filter @campus/grubhub login -- --user <userId>` (userId is shown on `/me`).
 
 Gaps in this flow: the delivery address is still global (`DELIVERY_*`); nobody times out if a member
 never 👍s; `describeCart` is in memory (after a restart a pending personal order's approval page

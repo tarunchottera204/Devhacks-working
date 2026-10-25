@@ -31,6 +31,7 @@ import {
   personalAgentId,
 } from "@campus/contracts";
 import { z } from "zod";
+import type { AccountLinkFlow } from "./account-link";
 import { counterofferCeiling } from "./coordinator";
 import { formatHistory, formatMoney, groupSystemPrompt } from "./prompts";
 
@@ -54,6 +55,8 @@ export type GroupAgentDeps = {
   invocationHint: string;
   /** Namespaced tool that returns `{ options: MealOption[] }`. */
   optionsTool: string;
+  /** Lets the payer connect their own ordering account from their 1:1 chat. */
+  accountLink?: AccountLinkFlow;
   coordinationTtlMs?: number;
   maxRounds?: number;
 };
@@ -580,7 +583,12 @@ export class GroupAgentImpl implements GroupAgent {
     const failed = ToolErrorSchema.safeParse(q.result.data);
     if (failed.success && failed.data.error === "account_not_connected") {
       await this.update(ctx, task, "failed", task.state);
-      return `${this.describeOrder(option.name, order, false)}\n${payer} needs to connect a Grubhub account before I can order on it. Nothing was ordered.`;
+      // Ask the payer privately to connect it; they then ask the group again.
+      const link = this.deps.accountLink;
+      const asked = link
+        ? await io.dmUser(order.payerUserId, await link.begin(ctx, order.payerUserId))
+        : false;
+      return `${this.describeOrder(option.name, order, false)}\n${payer} needs to connect a Grubhub account before I can order on it. Nothing was ordered.${asked ? ` ${payer}, I texted you how. Once it's connected, ask me again.` : ""}`;
     }
     const quote = ToolQuoteSchema.safeParse(q.result.data); // provider output is untrusted data
     if (!quote.success) return null;

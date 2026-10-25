@@ -14,4 +14,8 @@ export const AUDIT_ACTIONS_P2 = [
   "webhook.rejected",
   "session.created",
   "session.revoked",
+  "account_link.started",
+  "account_link.code_sent",
+  "account_link.connected",
+  "account_link.failed",
 ] as const;
