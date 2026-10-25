@@ -1,11 +1,15 @@
+import { HarnessError } from "@campus/contracts";
 import { describe, expect, it } from "vitest";
 import {
+  type GrubhubDiningOptions,
   cartTotal,
   categoryOf,
   createGrubhubDining,
   menuItems,
   normalizeStatus,
+  orderIdOf,
   requiredChoices,
+  savedCard,
   tagsFor,
 } from "../src/index";
 
@@ -44,7 +48,7 @@ const MENU = {
   },
 };
 
-type Call = { tool: string; args: Record<string, unknown> };
+type Call = { tool: string; args: Record<string, unknown>; user?: string };
 
 const DELIVERY = {
   street: "301 E Orange St",
@@ -68,7 +72,10 @@ const cart = (grand: number, tip = 0) => ({
   },
 });
 
-function fakeGrubhub(over: Partial<Record<string, (a: Record<string, unknown>) => unknown>> = {}) {
+function fakeGrubhub(
+  over: Partial<Record<string, (a: Record<string, unknown>) => unknown>> = {},
+  extra: Partial<Pick<GrubhubDiningOptions, "checkoutEnabled">> & { accounts?: string[] } = {},
+) {
   const calls: Call[] = [];
   const base: Record<string, (a: Record<string, unknown>) => unknown> = {
     search_restaurants: () => ({
@@ -95,23 +102,39 @@ function fakeGrubhub(over: Partial<Record<string, (a: Record<string, unknown>) =
     cart_read: () => cart(1234),
     cart_set_tip: () => ({ ok: true }),
     track_order: () => ({ status: "OUT_FOR_DELIVERY", estimated_delivery_minutes: 12 }),
+    get_payment_methods: () => ({
+      payment_methods: [{ id: "pm-1", type: "CREDIT_CARD", brand: "VISA", default: true }],
+    }),
+    cart_add_payment: () => ({ ok: true }),
+    cart_checkout: () => ({ order_id: "GH-1" }),
   };
   const impl = { ...base, ...over };
-  const call = async (tool: string, args: Record<string, unknown>) => {
-    calls.push({ tool, args });
+  const caller = (user?: string) => async (tool: string, args: Record<string, unknown>) => {
+    calls.push({ tool, args, ...(user ? { user } : {}) });
     const f = impl[tool];
     if (!f) throw new Error(`unexpected tool ${tool}`);
     return f(args);
   };
   const dining = createGrubhubDining({
-    call,
+    call: caller(),
     latitude: 33.4242,
     longitude: -111.9281,
     delivery: DELIVERY,
     maxOrderMinor: 5000,
+    ...(extra.accounts
+      ? { callFor: (userId: string) => (extra.accounts!.includes(userId) ? caller(userId) : null) }
+      : {}),
+    ...(extra.checkoutEnabled ? { checkoutEnabled: true } : {}),
   });
-  return { calls, h: dining.handlers, manifests: dining.manifests };
+  return { calls, h: dining.handlers, manifests: dining.manifests, describeCart: dining.describeCart };
 }
+
+const AS_ANN = { userId: "ann" };
+const QUOTE = { optionId: "gh_926742", items: [{ itemId: "11", quantity: 2 }] };
+/** Grubhub answered with an HTTP status (our cart tools' {"error", "status"} shape). */
+const http = (status: number) => () => {
+  throw new HarnessError("provider_error", `HTTP ${status}`, { details: { tool: "x", status } });
+};
 
 describe("menu mapping", () => {
   it("keeps orderable items, drops sauces and breakfast, infers vegetarian from names/categories", () => {
@@ -228,7 +251,7 @@ describe("dining tools backed by Grubhub", () => {
     expect(q.subtotalMinor).toBe(199);
   });
 
-  it("submit: refuses a changed total or one over the cap; checkout is not wired yet (fails closed)", async () => {
+  it("submit: refuses a changed total or one over the cap; checkout is off by default (fails closed)", async () => {
     const ok = fakeGrubhub();
     expect(await ok.h.submit_order!({ cartId: "cart-1", approvedTotalMinor: 1234 })).toEqual({
       provider: "grubhub",
@@ -249,6 +272,161 @@ describe("dining tools backed by Grubhub", () => {
     ).rejects.toMatchObject({
       code: "permission_denied",
     });
+  });
+
+  it("per-person accounts: the cart is built on the caller's own account; no account → account_not_connected", async () => {
+    const { h, calls, describeCart } = fakeGrubhub({}, { accounts: ["ann"] });
+    await h.search_options!({ query: "taco bell" }, AS_ANN);
+    expect(calls.find((c) => c.tool === "search_restaurants")!.user).toBeUndefined(); // shared session
+    const q = (await h.quote_order!(QUOTE, AS_ANN)) as Record<string, unknown>;
+    expect(q).toMatchObject({
+      cartId: "cart-1",
+      totalMinor: 1234,
+      items: [{ itemId: "11", name: "Bean Burrito", quantity: 2, priceMinor: 199 }],
+    });
+    expect(q).not.toHaveProperty("userId");
+    expect(calls.filter((c) => c.tool.startsWith("cart_")).every((c) => c.user === "ann")).toBe(true);
+    expect(describeCart("cart-1")).toMatchObject({
+      userId: "ann",
+      restaurant: "Taco Bell",
+      totalMinor: 1234,
+    });
+    expect(describeCart("nope")).toBeNull();
+
+    expect(await h.quote_order!(QUOTE, { userId: "bob" })).toEqual({
+      provider: "grubhub",
+      error: "account_not_connected",
+    });
+    expect(
+      await h.submit_order!({ cartId: "cart-1", approvedTotalMinor: 1234 }, { userId: "bob" }),
+    ).toMatchObject({
+      placed: false,
+      reason: "account_not_connected",
+    });
+    expect(await h.order_status!({ orderId: "GH-1" }, { userId: "bob" })).toMatchObject({
+      status: "unknown",
+    });
+    expect(await h.order_status!({ orderId: "GH-1" }, AS_ANN)).toMatchObject({ status: "on_the_way" });
+    expect(calls.find((c) => c.tool === "track_order")!.user).toBe("ann");
+  });
+
+  it("submit: refuses a cart quoted on someone else's account", async () => {
+    const { h, calls } = fakeGrubhub({}, { accounts: ["ann", "bob"], checkoutEnabled: true });
+    await h.quote_order!(QUOTE, AS_ANN);
+    expect(await h.submit_order!({ cartId: "cart-1", approvedTotalMinor: 1234 }, { userId: "bob" })).toEqual({
+      provider: "grubhub",
+      placed: false,
+      reason: "not_your_cart",
+    });
+    expect(calls.some((c) => c.tool === "cart_checkout")).toBe(false);
+  });
+
+  it("submit with checkout on: attaches the saved card for the exact total, checks out, returns the order id", async () => {
+    const { h, calls } = fakeGrubhub({}, { accounts: ["ann"], checkoutEnabled: true });
+    await h.quote_order!(QUOTE, AS_ANN);
+    expect(await h.submit_order!({ cartId: "cart-1", approvedTotalMinor: 1234 }, AS_ANN)).toEqual({
+      provider: "grubhub",
+      placed: true,
+      orderId: "GH-1",
+    });
+    const tail = calls.slice(-4).map((c) => [c.tool, c.user]);
+    expect(tail).toEqual([
+      ["cart_read", "ann"],
+      ["get_payment_methods", "ann"],
+      ["cart_add_payment", "ann"],
+      ["cart_checkout", "ann"],
+    ]);
+    expect(calls.find((c) => c.tool === "cart_add_payment")!.args).toEqual({
+      cart_id: "cart-1",
+      payment_id: "pm-1",
+      payment_type: "CREDIT_CARD",
+      amount_cents: 1234,
+    });
+
+    const noCard = fakeGrubhub(
+      { get_payment_methods: () => [{ id: "ap", type: "APPLE_PAY" }] },
+      {
+        checkoutEnabled: true,
+      },
+    );
+    expect(await noCard.h.submit_order!({ cartId: "cart-1", approvedTotalMinor: 1234 })).toMatchObject({
+      placed: false,
+      reason: "no_saved_card",
+    });
+    expect(noCard.calls.some((c) => c.tool === "cart_checkout")).toBe(false);
+  });
+
+  it("submit failures: refused → not placed; timeout, 5xx or no order id → outcome unknown", async () => {
+    const submit = async (over: Parameters<typeof fakeGrubhub>[0]) =>
+      fakeGrubhub(over, { checkoutEnabled: true }).h.submit_order!({
+        cartId: "cart-1",
+        approvedTotalMinor: 1234,
+      });
+    expect(await submit({ cart_add_payment: http(422) })).toMatchObject({
+      placed: false,
+      reason: "payment_rejected",
+    });
+    expect(await submit({ cart_checkout: http(409) })).toEqual({
+      provider: "grubhub",
+      placed: false,
+      reason: "checkout_rejected",
+    });
+    expect(await submit({ cart_checkout: http(503) })).toMatchObject({ placed: false, outcomeUnknown: true });
+    expect(
+      await submit({
+        cart_checkout: () => {
+          throw new HarnessError("provider_error", "grubhub cart_checkout failed");
+        },
+      }),
+    ).toMatchObject({ placed: false, outcomeUnknown: true, reason: "checkout_unconfirmed" });
+    expect(await submit({ cart_checkout: () => ({ ok: true }) })).toMatchObject({
+      placed: false,
+      outcomeUnknown: true,
+      reason: "no_order_id",
+    });
+    expect(orderIdOf({ order: { id: "GH-9" } })).toBe("GH-9");
+  });
+
+  it("savedCard: plain cards only, the default first; wallets, gift cards and expired cards skipped", () => {
+    const now = new Date("2026-10-25T12:00:00Z");
+    expect(
+      savedCard(
+        [
+          { id: "ap", type: "APPLE_PAY", default: true },
+          { id: "gp", type: "GOOGLE_PAY" },
+          { id: "pp", type: "PAYPAL" },
+          { id: "vm", type: "VENMO" },
+          { id: "gift", type: "GIFT_CARD" },
+          { id: "old", type: "CREDIT_CARD", exp_month: 9, exp_year: 26 },
+          { id: "visa", type: "CREDIT_CARD", brand: "VISA", expiration_month: 10, expiration_year: 2026 },
+          {
+            id: "mc",
+            type: "CREDIT_CARD",
+            brand: "MASTERCARD",
+            is_default: true,
+            expiration_month: 1,
+            expiration_year: 2030,
+          },
+        ],
+        now,
+      ),
+    ).toEqual({ id: "mc", type: "CREDIT_CARD" });
+    expect(savedCard({ credit_cards: [{ id: "c1", type: "CREDIT_CARD" }] }, now)).toEqual({
+      id: "c1",
+      type: "CREDIT_CARD",
+    });
+    // Good through the end of its expiry month.
+    expect(savedCard([{ id: "v", type: "CREDIT_CARD", exp_month: 10, exp_year: 2026 }], now)?.id).toBe("v");
+    expect(
+      savedCard(
+        [
+          { id: "x", type: "APPLE_PAY" },
+          { id: "y", type: "CREDIT_CARD", expired: true },
+        ],
+        now,
+      ),
+    ).toBeNull();
+    expect(savedCard({}, now)).toBeNull();
   });
 
   it("required choices: defaulted options first, nested required groups as child_options, optional groups skipped", () => {

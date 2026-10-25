@@ -9,8 +9,11 @@
 // Import rule: only @campus/contracts and files inside this package.
 export {
   GRUBHUB_MCP_VERSION,
+  GrubhubAccounts,
   GrubhubProcess,
+  userSessionDir,
   type GrubhubCaller,
+  type GrubhubCallerFor,
   type GrubhubProcessOptions,
 } from "./client";
 export {
@@ -20,9 +23,12 @@ export {
   grubhubDiningManifests,
   menuItems,
   normalizeStatus,
+  orderIdOf,
   requiredChoices,
+  savedCard,
   tagsFor,
   type CartOption,
+  type CartSummary,
   type DeliveryInfo,
   type GrubhubDiningOptions,
 } from "./dining";

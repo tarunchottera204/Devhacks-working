@@ -81,6 +81,9 @@ The user wants **as few external links as possible**: confirmations by 👍 tapb
 
 ## Grubhub status (cart + real total work; checkout not yet)
 
+> Historical (first live session). Carts and real totals now work through our own cart tools; see
+> "Who pays" below and `packages/grubhub/README.md` for the current state.
+
 Verified live 2026-10-25 against `api-gtm.grubhub.com` (Grubhub's private app API):
 - ✅ anonymous search near ASU (Taco Bell id `926742`), menus, item option groups.
 - ❌ **Password login → 403** for two different accounts (Grubhub blocks this client's password login).
@@ -102,6 +105,37 @@ Options presented to the user (they hadn't chosen yet):
    place-order, clearly marked as a test. Recommended as the fallback regardless.
 The order pipeline is provider-agnostic (`dining__quote_order` / `submit_order` / `order_status`), so
 any of these plugs in by implementing those tools.
+
+## Who pays: each person's own Grubhub account (branch `grub`)
+
+Since this was written, cart building and pricing work (see `packages/grubhub/README.md`), and orders
+run on **each person's own Grubhub account**, paid with the plain card saved there:
+
+- **Personal (1:1 chat):** the personal agent searches, reads the menu, quotes, tells the person the
+  exact total and only proposes `dining__submit_order` when told to. The gateway's spend ask goes to
+  their DM; `SpendAwareApprovals` (container) records a `personal_meal` task so `/approve/:id` shows
+  "Place your order". Updates go to their DM.
+- **Group:** the payer is **the person who asked** (`invokedByUserId`), not whoever confirmed (also on
+  the test-data handoff path). The quote runs as the payer (`asPayer(ctx)`), so the cart is on their
+  account. The order is posted with everyone's split; each person with a share 👍s exactly that
+  message or says "confirm" (status `awaiting_confirmations`; the payer's 👍 and repeats don't count);
+  a 👎 from one of them cancels. Then `submit_order` is proposed as the payer, who gets the approval
+  link by DM. No account → the group is told the payer needs to connect Grubhub.
+- **After a group order is placed:** each person gets a DM: "Your share of the X order is $Y (items).
+  Pay Avery back." Tracking runs on the payer's account.
+- **Checkout itself is still unverified** and behind `GRUBHUB_CHECKOUT_ENABLED` (default off → fails
+  closed). Grubhub 4xx = not placed; timeout/5xx/no order id = outcome unknown
+  (`needs_reconciliation`). Verifying it needs a HAR of one real checkout; see the Grubhub README.
+  **Never run checkout live without the account owner's explicit OK.**
+- Each person signs in once: `corepack pnpm --filter @campus/grubhub login -- --user <userId>`
+  (userId is shown on `/me`).
+
+Gaps in this flow: the delivery address is still global (`DELIVERY_*`); nobody times out if a member
+never 👍s; `describeCart` is in memory (after a restart a pending personal order's approval page
+shows nothing waiting); simultaneous 👍s can hit `task_conflict` and drop one; personal orders
+aren't recorded with `USE_REAL_TOOLS=true` (P4's gateway); `FakeToolGateway.execute` doesn't catch
+handler throws (a cap violation inside `submit_order` becomes an unknown outcome or a page error);
+its 15 s tool timeout may be short for a real checkout.
 
 ## Other known gaps / small fixes
 

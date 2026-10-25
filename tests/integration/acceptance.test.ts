@@ -124,8 +124,9 @@ describe("18.9-3 group mention → group agent; personal agents answer with proj
     const sim = await makeSim();
     await sim.group(GROUP, AVERY.externalId, ALL_MEMBERS, "@agent dinner tonight? under $20 each");
     const t = await sim.group(GROUP, CASEY.externalId, ALL_MEMBERS, "@agent confirm");
+    // The payer is whoever asked (Avery), not whoever confirmed.
     const dm = t.sent.find((m) => m.kind === "dm")!;
-    expect(dm.to).toBe(CASEY.externalId);
+    expect(dm.to).toBe(AVERY.externalId);
     expect(dm.text).toMatch(/https:\/\/app\.test\/approve\//);
     expect(dm.text).toContain("sandbox");
     const groupMsg = t.sent.find((m) => m.kind === "group")!.text;
@@ -138,7 +139,7 @@ describe("18.9-3 group mention → group agent; personal agents answer with proj
     ).toBe(true);
     // A "YES 1234" text can never approve a spend handoff.
     const approval = sim.c.fakes.approvals!.approvals.find((a) => a.kind === "spend_handoff")!;
-    const reply = await sim.dm(CASEY.externalId, `YES ${approval.code}`);
+    const reply = await sim.dm(AVERY.externalId, `YES ${approval.code}`);
     expect(reply.sent[0]!.text).toMatch(/secure page/);
     expect(approval.status).toBe("pending");
     await sim.c.close();

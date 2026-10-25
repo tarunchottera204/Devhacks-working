@@ -11,7 +11,11 @@ carts stay empty. The calls below were checked live on 2026-10-25 (Taco Bell nea
   POST /carts/{id}/tip                 -> 204             {amount (cents), type: INCLUDE_IN_BILL}
   GET  /carts/{id}                     -> charges.diner_grand_total etc.
 
-Placing the order (checkout) is NOT implemented here yet: it hasn't been verified.
+Placing the order uses two more calls that are NOT verified yet (guessed from the API's conventions;
+the TS side only calls them when GRUBHUB_CHECKOUT_ENABLED=true):
+
+  POST /carts/{id}/payments            {payment_id, type, amount}   attach a saved card
+  POST /carts/{id}/checkout                                         place the order
 
 Start: uv run --no-project --with grubhub-mcp==1.1.7 python campus_grubhub.py
 """
@@ -115,6 +119,25 @@ async def cart_set_tip(cart_id: str, amount_cents: int) -> str:
 async def cart_read(cart_id: str) -> str:
     """The cart with Grubhub's charges (diner_grand_total, fees, taxes, tip)."""
     return await _call("GET", f"/carts/{_id(cart_id)}")
+
+
+@mcp.tool()
+async def cart_add_payment(cart_id: str, payment_id: str, payment_type: str, amount_cents: int) -> str:
+    """UNVERIFIED. Attach one of the account's saved payment methods to the cart for amount_cents."""
+    if not payment_type.replace("_", "").isalpha() or len(payment_type) > 40:
+        raise ValueError("bad payment type")
+    return await _call("POST", f"/carts/{_id(cart_id)}/payments", {
+        "payment_id": _id(payment_id),
+        "type": payment_type,
+        "amount": int(amount_cents),
+    })
+
+
+@mcp.tool()
+async def cart_checkout(cart_id: str) -> str:
+    """UNVERIFIED. Place the order with the payment attached to the cart. Charges real money."""
+    return await _call("POST", f"/carts/{_id(cart_id)}/checkout",
+                       {"brand": "GRUBHUB", "experiments": EXPERIMENTS})
 
 
 if __name__ == "__main__":

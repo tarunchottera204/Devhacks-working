@@ -50,6 +50,8 @@ export type GroupMealStatus =
   | "proposed"
   | "decided"
   | "handed_off"
+  /** Real order quoted; waiting for everyone with a share to agree to it (👍 or "confirm"). */
+  | "awaiting_confirmations"
   /** Real order quoted; waiting for the payer to approve the exact total. */
   | "awaiting_payment"
   /** Placed with the provider; tracking until delivered. */
@@ -85,37 +87,59 @@ export type GroupMealState = {
   decision?: { optionId: string; decidedByUserId: string; decidedAt: string };
   handoff?: { approvalId: string; payerUserId: string; sandbox: boolean };
   /** Item-level group order built from each member's agent's picks (additive, P2 contribution). */
-  order?: {
-    restaurant: string;
-    currency: string;
-    lines: Array<{
-      userId: string;
-      name: string | null;
-      items: Array<{ itemId: string; name: string; quantity: number; priceMinor: number }>;
-      subtotalMinor: number;
-    }>;
-    /** Members whose agent picked nothing (no acceptable item, or no answer). */
-    notIncluded: string[];
+  order?: MealOrder;
+};
+
+/** A food order: who gets what, who pays, the provider quote and where updates go. */
+export type MealOrder = {
+  restaurant: string;
+  currency: string;
+  lines: Array<{
+    userId: string;
+    name: string | null;
+    items: Array<{ itemId: string; name: string; quantity: number; priceMinor: number }>;
+    subtotalMinor: number;
+  }>;
+  /** Members whose agent picked nothing (no acceptable item, or no answer). */
+  notIncluded: string[];
+  totalMinor: number;
+  /** Pays on their own provider account: the person who asked for the order. */
+  payerUserId: string;
+  /** For messages, when the payer has no line of their own. */
+  payerName?: string | null;
+  /** Each non-payer owes the payer their share (their items + a proportional share of tax/fees). */
+  splits: Array<{ userId: string; name: string | null; owesMinor: number }>;
+  /** Real provider quote (exact amount the payer approves). Absent with test data. */
+  quote?: {
+    provider: string;
+    cartId: string;
     totalMinor: number;
-    payerUserId: string;
-    /** Each non-payer owes the payer their share (their items + a proportional share of tax/fees). */
-    splits: Array<{ userId: string; name: string | null; owesMinor: number }>;
-    /** Real provider quote (exact amount the payer approves). Absent with test data. */
-    quote?: {
-      provider: string;
-      cartId: string;
-      totalMinor: number;
-      subtotalMinor: number;
-      taxMinor: number | null;
-      feesMinor: number | null;
-      tipMinor: number;
-    };
-    /** The gateway approval for submit_order (spend). */
-    approvalId?: string;
-    /** Where to post order updates (the original group). */
-    delivery?: { platform: string; providerConversationId: string };
-    providerOrderId?: string;
-    trackingStatus?: string;
-    placedAt?: string;
+    subtotalMinor: number;
+    taxMinor: number | null;
+    feesMinor: number | null;
+    tipMinor: number;
   };
+  /**
+   * Group orders: everyone with a share agrees to it before the payer is asked to pay. A 👍 on exactly
+   * `messageId` (the order message we sent), or a "confirm" from them, counts.
+   */
+  confirmations?: { messageId?: string; needed: string[]; confirmed: string[] };
+  /** The gateway approval for submit_order (spend). */
+  approvalId?: string;
+  /** Where to post order updates: the group, or the person's 1:1 chat when `dm`. */
+  delivery?: { platform: string; providerConversationId: string; dm?: boolean };
+  providerOrderId?: string;
+  trackingStatus?: string;
+  placedAt?: string;
+};
+
+// ---- personal_meal task state (one person orders for themselves in their 1:1 chat) ----
+
+export type PersonalMealStatus =
+  "awaiting_payment" | "ordered" | "needs_reconciliation" | "completed" | "cancelled" | "failed";
+
+export type PersonalMealState = {
+  userId: string;
+  /** One line (theirs), no splits; paid with the card saved on their own provider account. */
+  order: MealOrder;
 };

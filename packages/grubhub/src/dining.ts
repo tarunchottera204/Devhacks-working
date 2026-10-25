@@ -6,7 +6,7 @@ import {
   type ToolManifest,
 } from "@campus/contracts";
 import { z } from "zod";
-import type { GrubhubCaller } from "./client";
+import type { GrubhubCaller, GrubhubCallerFor } from "./client";
 
 // The "dining" tools the agents already use, backed by Grubhub (real restaurants, real menus, real
 // orders). Same tool names as the test provider, so the group/personal agents don't change:
@@ -16,6 +16,10 @@ import type { GrubhubCaller } from "./client";
 //   dining__quote_order     read   builds a Grubhub cart and returns the REAL total (tax, fees). No charge.
 //   dining__submit_order    spend  places that exact cart; refuses if the total changed. Needs approval.
 //   dining__order_status    read   delivery tracking
+//
+// Search and menus use the shared session. Quotes, orders and tracking run on the CALLER's own
+// Grubhub account (ctx.userId -> callFor), so the cart is theirs and it's paid with the card saved
+// there. Placing the order (attach card + check out) is unverified and off unless checkoutEnabled.
 //
 // Grubhub data has no dietary tags, so `vegetarian_friendly` is inferred from category/item names
 // (e.g. Taco Bell's "Veggie Cravings") — a heuristic, labelled as such.
@@ -28,6 +32,10 @@ export type GrubhubDiningOptions = {
   delivery: DeliveryInfo;
   /** Hard cap per order (minor units), checked again at submit. */
   maxOrderMinor: number;
+  /** Each person's own account. Absent: everything runs on `call` (one shared account). */
+  callFor?: GrubhubCallerFor;
+  /** Place orders for real (GRUBHUB_CHECKOUT_ENABLED). Off: submit_order fails closed. */
+  checkoutEnabled?: boolean;
   logger?: Logger;
   now?: () => number;
 };
@@ -47,7 +55,22 @@ export type DeliveryInfo = {
 /** A chosen option; nested required choices go in child_options (Grubhub's cart format). */
 export type CartOption = { id: string; quantity: number; child_options: CartOption[] };
 
-type Handler = (args: Record<string, unknown>) => Promise<unknown>;
+/** What a quoted cart holds (kept in memory, so it's lost on restart). */
+export type CartSummary = {
+  cartId: string;
+  /** Whose Grubhub account the cart is on. */
+  userId: string;
+  restaurant: string;
+  currency: string;
+  items: Array<{ itemId: string; name: string; quantity: number; priceMinor: number }>;
+  subtotalMinor: number;
+  taxMinor: number | null;
+  feesMinor: number | null;
+  tipMinor: number;
+  totalMinor: number | null;
+};
+
+type Handler = (args: Record<string, unknown>, ctx?: { userId: string }) => Promise<unknown>;
 
 const SERVER = "dining";
 const OPTION_PREFIX = "gh_";
@@ -108,7 +131,8 @@ export const grubhubDiningManifests: ToolManifest[] = [
   {
     server: SERVER,
     name: "submit_order",
-    description: "Place a quoted Grubhub order. Moves real money with the account's saved card.",
+    description:
+      "Place a quoted Grubhub order on the person's own account. Moves real money with the card saved there.",
     inputSchema: {
       type: "object",
       properties: {
@@ -300,14 +324,68 @@ export function requiredChoices(categories: unknown): CartOption[] {
   return out;
 }
 
+const WALLET = /apple|google|android|paypal|venmo|gift|amazon|cash|campus|klarna|afterpay|wallet/i;
+const CARD = /card|credit|debit|visa|master|amex|american|discover/i;
+
+/**
+ * The saved card to pay with: a plain credit/debit card, the default one first. Wallets (Apple Pay
+ * needs Face ID on the person's phone), PayPal, Venmo, gift cards and expired cards are skipped.
+ * get_payment_methods' shape isn't verified yet, so the field names are read tolerantly.
+ */
+export function savedCard(json: unknown, now = new Date()): { id: string; type: string } | null {
+  const o = obj(json);
+  const list = Array.isArray(json)
+    ? json
+    : arr(o.payment_methods ?? o.paymentMethods ?? o.credit_cards ?? o.cards ?? o.payments ?? o.items);
+  const cards = list.map(obj).flatMap((p) => {
+    const id = str(p.id ?? p.payment_id ?? p.credential_id);
+    const type = str(p.type ?? p.payment_type ?? p.payment_method_type);
+    const kind = [type, str(p.brand), str(p.card_type), str(p.name)].filter(Boolean).join(" ");
+    if (!id || !type || WALLET.test(kind) || !CARD.test(kind) || p.expired === true) return [];
+    const exp = obj(p.expiration);
+    const month = Number(p.expiration_month ?? p.exp_month ?? exp.month);
+    let year = Number(p.expiration_year ?? p.exp_year ?? exp.year);
+    if (year > 0 && year < 100) year += 2000;
+    // A card is good through the last day of its expiry month.
+    if (month >= 1 && month <= 12 && year > 0 && new Date(year, month, 1) <= now) return [];
+    const isDefault = p.default === true || p.is_default === true || p.preferred === true;
+    return [{ id, type, isDefault }];
+  });
+  const pick = cards.find((c) => c.isDefault) ?? cards[0];
+  return pick ? { id: pick.id, type: pick.type } : null;
+}
+
+/** The order id in a checkout response (shape unverified: read tolerantly). */
+export function orderIdOf(json: unknown): string | null {
+  const o = obj(json);
+  const order = obj(o.order);
+  return str(o.order_id ?? o.orderId ?? order.id ?? order.order_id ?? o.order_number ?? o.id);
+}
+
+/** Grubhub's HTTP status on a failed call, when it answered at all. */
+const httpStatus = (err: unknown): number | null => {
+  const s = err instanceof HarnessError ? err.details?.status : undefined;
+  return typeof s === "number" ? s : null;
+};
+
 export function createGrubhubDining(opts: GrubhubDiningOptions): {
   manifests: ToolManifest[];
   handlers: Record<string, Handler>;
+  /** A quoted cart (for the approval page of a personal order); null when unknown. */
+  describeCart: (cartId: string) => CartSummary | null;
 } {
   const { call } = opts;
   const now = opts.now ?? Date.now;
   const where = { latitude: opts.latitude, longitude: opts.longitude };
   const menus = new Map<string, { at: number; items: MenuItem[]; name: string }>();
+  const carts = new Map<string, CartSummary>();
+
+  /** The caller's own account; null when they haven't signed in. One shared account without callFor. */
+  const account = (ctx?: { userId: string }): GrubhubCaller | null => {
+    if (!opts.callFor) return call;
+    if (!ctx?.userId) throw new HarnessError("tool_args_invalid", "no caller");
+    return opts.callFor(ctx.userId);
+  };
 
   const restaurantIdOf = (optionId: unknown): string => {
     const v = typeof optionId === "string" ? optionId : "";
@@ -387,18 +465,21 @@ export function createGrubhubDining(opts: GrubhubDiningOptions): {
       return { provider: "grubhub", restaurant: menu.name, items: menu.items };
     },
 
-    quote_order: async (args) => {
+    quote_order: async (args, ctx) => {
       const restaurantId = restaurantIdOf(args.optionId);
       const items = ItemsSchema.parse(args.items);
       const menu = await menuFor(restaurantId);
       const known = new Set(menu.items.map((i) => i.id));
       if (!items.every((i) => known.has(i.itemId)))
         throw new HarnessError("tool_args_invalid", "item not on the menu");
+      // The cart is built on the caller's own account, so it's theirs to pay for.
+      const acct = account(ctx);
+      if (!acct) return { provider: "grubhub", error: "account_not_connected" };
       // Order matters: Grubhub prices items for the cart's fulfillment, so the delivery address goes
       // first (without it an item is refused as "not open" when pickup is closed).
-      const cartId = str(obj(await call("cart_new", {})).id);
+      const cartId = str(obj(await acct("cart_new", {})).id);
       if (!cartId) throw new HarnessError("provider_error", "Grubhub did not return a cart");
-      await call("cart_set_delivery", {
+      await acct("cart_set_delivery", {
         cart_id: cartId,
         street: d.street,
         city: d.city,
@@ -412,7 +493,7 @@ export function createGrubhubDining(opts: GrubhubDiningOptions): {
         ...(d.instructions ? { instructions: d.instructions } : {}),
       });
       for (const it of items) {
-        await call("cart_add_line", {
+        await acct("cart_add_line", {
           cart_id: cartId,
           restaurant_id: restaurantId,
           menu_item_id: it.itemId,
@@ -421,16 +502,19 @@ export function createGrubhubDining(opts: GrubhubDiningOptions): {
         });
       }
       const tipMinor = typeof args.tipMinor === "number" ? args.tipMinor : 0;
-      if (tipMinor > 0) await call("cart_set_tip", { cart_id: cartId, amount_cents: tipMinor });
-      const t = cartTotal(await call("cart_read", { cart_id: cartId }));
-      const menuSubtotal = items.reduce(
-        (n, i) => n + menu.items.find((m) => m.id === i.itemId)!.priceMinor * i.quantity,
-        0,
-      );
-      return {
-        provider: "grubhub",
+      if (tipMinor > 0) await acct("cart_set_tip", { cart_id: cartId, amount_cents: tipMinor });
+      const t = cartTotal(await acct("cart_read", { cart_id: cartId }));
+      const lines = items.map((i) => {
+        const m = menu.items.find((x) => x.id === i.itemId)!;
+        return { itemId: m.id, name: m.name, quantity: i.quantity, priceMinor: m.priceMinor };
+      });
+      const menuSubtotal = lines.reduce((n, l) => n + l.priceMinor * l.quantity, 0);
+      const summary: CartSummary = {
         cartId,
+        userId: ctx?.userId ?? "",
         restaurant: menu.name,
+        currency: menu.items[0]?.currency ?? "USD",
+        items: lines,
         // Null when Grubhub doesn't show the final total before checkout; the agent then refuses to
         // ask for approval of an amount it can't state exactly.
         totalMinor: t.totalMinor,
@@ -438,37 +522,96 @@ export function createGrubhubDining(opts: GrubhubDiningOptions): {
         taxMinor: t.taxMinor,
         feesMinor: t.feesMinor,
         tipMinor: t.tipMinor ?? tipMinor,
-        currency: menu.items[0]?.currency ?? "USD",
       };
+      carts.set(cartId, summary);
+      const { userId: _owner, ...shown } = summary;
+      return { provider: "grubhub", ...shown };
     },
 
-    submit_order: async (args) => {
+    submit_order: async (args, ctx) => {
       const cartId = str(args.cartId);
       const approved = typeof args.approvedTotalMinor === "number" ? args.approvedTotalMinor : NaN;
       if (!cartId || !Number.isInteger(approved))
         throw new HarnessError("tool_args_invalid", "cartId and approvedTotalMinor are required");
       if (approved > opts.maxOrderMinor)
         throw new HarnessError("permission_denied", "order is over the spending cap");
+      const notPlaced = (reason: string, extra: Record<string, unknown> = {}) => ({
+        provider: "grubhub",
+        placed: false,
+        reason,
+        ...extra,
+      });
+      const acct = account(ctx);
+      if (!acct) return notPlaced("account_not_connected");
+      // Only the person whose account the cart is on can order it.
+      const known = carts.get(cartId);
+      if (opts.callFor && known && known.userId !== ctx?.userId) return notPlaced("not_your_cart");
       // Exact-quote binding: re-read the cart and refuse if what would be charged changed.
-      const current = cartTotal(await call("cart_read", { cart_id: cartId })).totalMinor;
+      const current = cartTotal(await acct("cart_read", { cart_id: cartId })).totalMinor;
       if (current === null || Math.abs(current - approved) > TOTAL_TOLERANCE_MINOR)
-        return { provider: "grubhub", placed: false, reason: "total_changed", currentTotalMinor: current };
-      // Checkout isn't wired yet: grubhub-mcp's place_order calls an endpoint Grubhub doesn't serve,
-      // and the real checkout call (attach saved card + check out) hasn't been verified. Fail closed:
-      // nothing is charged and the group is told the order wasn't placed.
-      return { provider: "grubhub", placed: false, reason: "checkout_not_available" };
+        return notPlaced("total_changed", { currentTotalMinor: current });
+      // The checkout calls (attach saved card + check out) aren't verified yet: unless switched on,
+      // fail closed. Nothing is charged and the person is told the order wasn't placed.
+      if (!opts.checkoutEnabled) return notPlaced("checkout_not_available");
+
+      const card = savedCard(await acct("get_payment_methods", {}));
+      if (!card) return notPlaced("no_saved_card");
+      try {
+        // Attaching a card charges nothing, so any failure here means "not placed".
+        await acct("cart_add_payment", {
+          cart_id: cartId,
+          payment_id: card.id,
+          payment_type: card.type,
+          amount_cents: approved,
+        });
+      } catch (err) {
+        opts.logger?.warn("grubhub payment attach failed", { err });
+        return notPlaced("payment_rejected");
+      }
+      let placed: unknown;
+      try {
+        placed = await acct("cart_checkout", { cart_id: cartId });
+      } catch (err) {
+        // Grubhub refused it (4xx): not placed. A timeout or 5xx may still have placed it: never
+        // retry blindly; the person checks the app.
+        const status = httpStatus(err);
+        opts.logger?.warn("grubhub checkout failed", { status, err });
+        if (status !== null && status >= 400 && status < 500) return notPlaced("checkout_rejected");
+        return notPlaced("checkout_unconfirmed", { outcomeUnknown: true });
+      }
+      const orderId = orderIdOf(placed);
+      if (!orderId) return notPlaced("no_order_id", { outcomeUnknown: true });
+      carts.delete(cartId);
+      return { provider: "grubhub", placed: true, orderId };
     },
 
-    order_status: async (args) => {
+    order_status: async (args, ctx) => {
       const orderId = str(args.orderId);
       if (!orderId) throw new HarnessError("tool_args_invalid", "orderId is required");
+      // Orders live on the payer's own account.
+      const acct = account(ctx);
+      if (!acct)
+        return {
+          provider: "grubhub",
+          orderId,
+          status: "unknown",
+          etaMinutes: null,
+          detail: "account_not_connected",
+        };
       return {
         provider: "grubhub",
         orderId,
-        ...normalizeStatus(await call("track_order", { order_id: orderId })),
+        ...normalizeStatus(await acct("track_order", { order_id: orderId })),
       };
     },
   };
 
-  return { manifests: grubhubDiningManifests, handlers };
+  return {
+    manifests: grubhubDiningManifests,
+    handlers,
+    describeCart: (cartId) => {
+      const c = carts.get(cartId);
+      return c ? { ...c, items: c.items.map((i) => ({ ...i })) } : null;
+    },
+  };
 }

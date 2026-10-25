@@ -4,6 +4,7 @@ import {
   InProcessCoordinationBus,
   OrderService,
   PersonalAgentRegistry,
+  type QuotedCart,
   type WebApprovals,
 } from "@campus/agents";
 import {
@@ -35,7 +36,10 @@ import {
   type SqlClient,
   type TaskStore,
   type ToolGateway,
+  type ToolManifest,
+  type ToolProposal,
   type ToolsModule,
+  type TurnContext,
   createLogger,
   invocationNames,
   loadConfig,
@@ -66,7 +70,13 @@ import {
 } from "@campus/contracts/fakes";
 import { sampleToolManifests } from "@campus/contracts/fixtures";
 import { PgAuditLog, PgInboundQueue, PgMessageLog, PgTaskStore, createSqlClient } from "@campus/db";
-import { type GrubhubCaller, GrubhubProcess, createGrubhubDining } from "@campus/grubhub";
+import {
+  GrubhubAccounts,
+  type GrubhubCaller,
+  type GrubhubCallerFor,
+  GrubhubProcess,
+  createGrubhubDining,
+} from "@campus/grubhub";
 import {
   AgentRuntimeImpl,
   AnthropicModelClient,
@@ -113,7 +123,7 @@ export type Container = {
   worker: QueueWorker;
   /** Background jobs (memory cleanup/retention/group chat, order tracking). Start with the worker. */
   maintenance: MaintenanceScheduler | null;
-  /** Real group orders: payer approval → place → delivery tracking (posts to the group). */
+  /** Real orders (group and personal): payer approval → place → delivery tracking. */
   orders: OrderService;
   /** Which implementation each slot uses ("fake" | "real"), for logs and the simulator banner. */
   wiring: Record<string, "fake" | "real">;
@@ -138,8 +148,33 @@ export type ContainerOverrides = Partial<
     sql: SqlClient;
     /** Tests: a fake Grubhub instead of starting the grubhub-mcp process (DINING_PROVIDER=grubhub). */
     diningCaller: GrubhubCaller;
+    /** Tests: each person's own fake Grubhub account (null = not signed in). */
+    diningCallerFor: GrubhubCallerFor;
   }
 >;
+
+/**
+ * Fake approvals that also notice a personal order: when a 1:1 chat's agent proposes
+ * dining__submit_order, the order is recorded so the payer's approval page can show and place it.
+ * (Fake tools path only; P4's gateway doesn't do this yet.)
+ */
+class SpendAwareApprovals extends FakeApprovalService {
+  onPersonalSpend: ((ctx: TurnContext, approvalId: string, args: unknown) => Promise<unknown>) | null = null;
+
+  override async createToolAsk(ctx: TurnContext, input: { proposal: ToolProposal; manifest: ToolManifest }) {
+    const ask = await super.createToolAsk(ctx, input);
+    const m = input.manifest;
+    if (
+      this.onPersonalSpend &&
+      ctx.conversationType === "dm" &&
+      m.riskClass === "spend" &&
+      m.server === "dining" &&
+      m.name === "submit_order"
+    )
+      await this.onPersonalSpend(ctx, ask.approvalId, input.proposal.args);
+    return ask;
+  }
+}
 
 async function loadReal<T>(key: keyof typeof REAL_MODULES, deps: unknown): Promise<T> {
   const spec = REAL_MODULES[key];
@@ -261,6 +296,8 @@ export async function buildContainer(
     gateway: ToolGateway,
     permissions: PermissionResolver,
     connections: ConnectionService;
+  let describeCart: ((cartId: string) => QuotedCart | null) | undefined;
+  let spendAware: SpendAwareApprovals | null = null;
   if (config.USE_REAL_TOOLS) {
     approvals = await loadReal<ApprovalService>("approvals", moduleDeps);
     ({ gateway, permissions, connections } = await loadReal<ToolsModule>("tools", {
@@ -275,14 +312,23 @@ export async function buildContainer(
     // everything still goes through the gateway (submit_order is spend: approval + cap).
     let provider: FakeToolProvider;
     if (config.DINING_PROVIDER === "grubhub") {
+      // Search and menus: the shared session. Quotes, orders and tracking: each person's own account.
       let call = o.diningCaller;
+      let callFor = o.diningCallerFor;
       if (!call) {
         const gh = new GrubhubProcess({ sessionDir: config.GRUBHUB_SESSION_DIR, logger });
         closers.push(() => gh.close());
         call = gh.call;
       }
+      if (!callFor && !o.diningCaller) {
+        const accounts = new GrubhubAccounts({ sessionDir: config.GRUBHUB_SESSION_DIR, logger });
+        closers.push(() => accounts.close());
+        callFor = accounts.forUser;
+      }
       const dining = createGrubhubDining({
         call,
+        ...(callFor ? { callFor } : {}),
+        checkoutEnabled: config.GRUBHUB_CHECKOUT_ENABLED,
         latitude: config.DELIVERY_LATITUDE!,
         longitude: config.DELIVERY_LONGITUDE!,
         // Required by the config loader when DINING_PROVIDER=grubhub.
@@ -304,15 +350,19 @@ export async function buildContainer(
         ...dining.manifests,
       ]);
       for (const [tool, fn] of Object.entries(dining.handlers)) provider.handle("dining", tool, fn);
+      describeCart = dining.describeCart;
       wiring.dining = "real"; // Grubhub
     } else provider = new FakeToolProvider();
     fakes.toolProvider = provider;
     const fakeConnections = (fakes.connections = new FakeConnectionService({ defaultConnected: true }));
     const fakePermissions = (fakes.permissions = new FakePermissionResolver());
-    const fakeApprovals = (fakes.approvals = new FakeApprovalService({
-      ...(config.APP_ORIGIN ? { appOrigin: config.APP_ORIGIN } : {}),
-      clock,
-    }));
+    const fakeApprovals =
+      (fakes.approvals =
+      spendAware =
+        new SpendAwareApprovals({
+          ...(config.APP_ORIGIN ? { appOrigin: config.APP_ORIGIN } : {}),
+          clock,
+        }));
     approvals = fakeApprovals;
     permissions = fakePermissions;
     connections = fakeConnections;
@@ -392,17 +442,21 @@ export async function buildContainer(
     optionsTool: config.GROUP_MEAL_OPTIONS_TOOL,
   });
 
-  // Real group orders (payer approval → place → tracking). Scheduled with the memory jobs.
+  // Real orders, group and personal (payer approval → place → tracking). Scheduled with the memory jobs.
   const orders = new OrderService({
     tasks,
     gateway,
     messaging,
     approvals: approvals as unknown as WebApprovals,
+    identity,
     audit,
     clock,
     logger,
     statusTool: config.GROUP_MEAL_OPTIONS_TOOL.replace(/__.+$/, "__order_status"),
+    ...(describeCart ? { describeCart } : {}),
   });
+  if (spendAware)
+    spendAware.onPersonalSpend = (ctx, approvalId, args) => orders.recordPersonalOrder(ctx, approvalId, args);
   const orderJob = { name: "orders.track", everyMs: 30_000, run: () => orders.trackOrders() };
   maintenance = memoryMaintenance
     ? MaintenanceScheduler.forMemory(memoryMaintenance, {

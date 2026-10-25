@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HarnessError, type Logger } from "@campus/contracts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -8,7 +10,9 @@ import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotoc
 // official integration (team decision, see packages/grubhub/README.md). It is run unmodified as a
 // separate process (the repo has no license, so its code is never copied here).
 //
-// The Grubhub login session lives in GRUBHUB_SESSION_DIR (server-side, gitignored, never logged).
+// The Grubhub login session lives in GRUBHUB_SESSION_DIR (server-side, gitignored, never logged):
+// the shared session (search, menus) at its root, and each person's own account (their cart, saved
+// card, orders) in users/<userId>/.
 
 export const GRUBHUB_MCP_VERSION = "1.1.7";
 
@@ -62,12 +66,14 @@ export class GrubhubProcess {
       throw new HarnessError("provider_error", `grubhub ${tool} returned non-JSON`, { details: { tool } });
     }
     if (json && typeof json === "object" && "error" in json && Object.keys(json).length <= 2) {
-      // grubhub-mcp reports e.g. {"error": "Must be logged in to place an order"}
+      // grubhub-mcp reports e.g. {"error": "Must be logged in to place an order"}; our cart tools
+      // add Grubhub's HTTP status ({"error", "status"}), which tells a refusal from an unknown outcome.
+      const status = (json as { status?: unknown }).status;
       throw new HarnessError(
         "provider_error",
         `grubhub ${tool}: ${String((json as { error: unknown }).error).slice(0, 200)}`,
         {
-          details: { tool },
+          details: { tool, ...(typeof status === "number" ? { status } : {}) },
         },
       );
     }
@@ -118,5 +124,45 @@ export class GrubhubProcess {
       this.connecting = null;
     });
     return this.connecting;
+  }
+}
+
+/** grubhub-mcp's session file inside a session dir; present once someone has signed in. */
+const SESSION_FILE = "session.json";
+
+/** Where one person's own Grubhub session lives: <sessionDir>/users/<userId>. */
+export function userSessionDir(sessionDir: string, userId: string): string {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(userId)) throw new HarnessError("tool_args_invalid", "bad user id");
+  return join(sessionDir, "users", userId);
+}
+
+/** Resolves a person's own Grubhub account; null = they haven't signed in. */
+export type GrubhubCallerFor = (userId: string) => GrubhubCaller | null;
+
+/**
+ * Each person's own Grubhub account: one grubhub-mcp process per person who has signed in (with
+ * `pnpm --filter @campus/grubhub login -- --user <userId>`), started on first use.
+ */
+export class GrubhubAccounts {
+  private readonly processes = new Map<string, GrubhubProcess>();
+
+  /** `sessionDir`: the GRUBHUB_SESSION_DIR root (each person's session is under users/<userId>). */
+  constructor(private readonly opts: GrubhubProcessOptions) {}
+
+  readonly forUser: GrubhubCallerFor = (userId) => {
+    const dir = userSessionDir(this.opts.sessionDir, userId);
+    if (!existsSync(join(dir, SESSION_FILE))) return null;
+    let p = this.processes.get(userId);
+    if (!p) {
+      p = new GrubhubProcess({ ...this.opts, sessionDir: dir });
+      this.processes.set(userId, p);
+    }
+    return p.call;
+  };
+
+  async close(): Promise<void> {
+    const all = [...this.processes.values()];
+    this.processes.clear();
+    await Promise.all(all.map((p) => p.close()));
   }
 }
