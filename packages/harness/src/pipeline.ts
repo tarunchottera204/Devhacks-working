@@ -249,7 +249,7 @@ export class TurnPipelineImpl implements TurnPipeline {
 
       // [12] memory (consent-checked) — only ever for verified users; group chatter is not ingested.
       const candidates: MemoryCandidate[] = [...agentResult.memoryCandidates];
-      if (!msg.isGroup) {
+      if (!msg.isGroup && !agentResult.skipMessageMemory) {
         const c = dmMemoryCandidate({
           userId,
           conversationId: conversation.id,

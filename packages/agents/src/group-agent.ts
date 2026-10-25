@@ -31,6 +31,7 @@ import {
   personalAgentId,
 } from "@campus/contracts";
 import { z } from "zod";
+import type { AccountLinkFlow } from "./account-link";
 import { counterofferCeiling } from "./coordinator";
 import { formatHistory, formatMoney, groupSystemPrompt } from "./prompts";
 
@@ -54,6 +55,8 @@ export type GroupAgentDeps = {
   invocationHint: string;
   /** Namespaced tool that returns `{ options: MealOption[] }`. */
   optionsTool: string;
+  /** Lets the payer connect their own ordering account from their 1:1 chat. */
+  accountLink?: AccountLinkFlow;
   coordinationTtlMs?: number;
   maxRounds?: number;
 };
@@ -70,8 +73,18 @@ const ToolQuoteSchema = z.object({
   feesMinor: z.number().int().nullable().optional(),
   tipMinor: z.number().int().nonnegative().default(0),
 });
+const ToolErrorSchema = z.object({ error: z.string() });
 type GroupOrder = NonNullable<GroupMealState["order"]>;
 type Task = AgentTask<GroupMealState>;
+
+/** Statuses in which a new plan can't start: say "cancel" first. */
+const OPEN_STATUSES = ["collecting", "proposed", "awaiting_confirmations", "awaiting_payment"];
+
+/**
+ * The same turn, acting for the payer: the cart is built on their own provider account and the
+ * spend approval goes to their 1:1 chat, whoever's message moved the order along.
+ */
+const asPayer = (ctx: TurnContext, payerUserId: string): TurnContext => ({ ...ctx, userId: payerUserId });
 
 export class GroupAgentImpl implements GroupAgent {
   readonly agentId: string;
@@ -134,8 +147,9 @@ export class GroupAgentImpl implements GroupAgent {
 
   /**
    * Tapbacks (P2 contribution): a 👍 from a verified member on EXACTLY the proposal message we sent
-   * confirms it — deterministic, no model call, so chat text can't fake a confirmation. Everything
-   * else (other reactions, other messages, an un-like) is ignored silently.
+   * confirms it — deterministic, no model call, so chat text can't fake a confirmation. On the order
+   * message, a 👍 / 👎 from someone with a share agrees to / turns down their share. Everything else
+   * (other reactions, other messages, an un-like, the payer's own 👍, a repeat) is ignored silently.
    */
   private async handleReaction(
     ctx: TurnContext,
@@ -143,6 +157,8 @@ export class GroupAgentImpl implements GroupAgent {
     active: Task | null,
     io: TurnIO,
   ): Promise<AgentTurnResult> {
+    if (active?.status === "awaiting_confirmations")
+      return this.handleShareReaction(ctx, reaction, active, io);
     const proposalId = active?.status === "proposed" ? active.state.proposal?.messageId : undefined;
     const matches =
       reaction.type === "like" &&
@@ -160,6 +176,44 @@ export class GroupAgentImpl implements GroupAgent {
     return { ...out, detail: { intent: "confirm_task", via: "reaction" } };
   }
 
+  private async handleShareReaction(
+    ctx: TurnContext,
+    reaction: NonNullable<AgentTurnInput["reaction"]>,
+    active: Task,
+    io: TurnIO,
+  ): Promise<AgentTurnResult> {
+    const c = active.state.order?.confirmations;
+    const onOrder = !!c?.messageId && reaction.targetMessageId === c.messageId;
+    const open = !!c && c.needed.includes(ctx.userId) && !c.confirmed.includes(ctx.userId);
+    const vote =
+      onOrder && open && !reaction.removed
+        ? reaction.type === "like"
+          ? "agree"
+          : reaction.type === "dislike"
+            ? "decline"
+            : null
+        : null;
+    await this.audit(ctx, "coordination.reaction", {
+      type: reaction.type,
+      removed: reaction.removed,
+      onOrder,
+      confirms: vote === "agree",
+      declines: vote === "decline",
+    });
+    if (!vote) return { replies: [], memoryCandidates: [], detail: { intent: "reaction_ignored" } };
+    if (vote === "decline") {
+      await this.update(ctx, active, "cancelled", active.state);
+      const name = this.nameIn(active.state.order!, ctx.userId);
+      return {
+        replies: [`${name} turned down their share, so I cancelled the order. Nothing was ordered.`],
+        memoryCandidates: [],
+        detail: { intent: "cancel_task", via: "reaction" },
+      };
+    }
+    const out = await this.confirmShare(ctx, active, io);
+    return { ...out, detail: { intent: "confirm_task", via: "reaction" } };
+  }
+
   // ---- intents ----
 
   private async handleIntent(
@@ -170,16 +224,21 @@ export class GroupAgentImpl implements GroupAgent {
   ): Promise<{ replies: string[]; memoryCandidates: MemoryCandidate[] }> {
     switch (intent.kind) {
       case "start_task":
-        if (active && (active.status === "collecting" || active.status === "proposed")) {
+        if (active && OPEN_STATUSES.includes(active.status)) {
+          const order = active.status === "awaiting_confirmations" || active.status === "awaiting_payment";
           return {
             replies: [
-              `We already have a plan going: ${this.describeTask(active)} Say "confirm" to lock it in or "cancel" to start over.`,
+              order
+                ? `There's an order open: ${this.describeTask(active)} Say "cancel" to drop it first.`
+                : `We already have a plan going: ${this.describeTask(active)} Say "confirm" to lock it in or "cancel" to start over.`,
             ],
             memoryCandidates: [],
           };
         }
         return { replies: [await this.startMeal(ctx, intent.params, io)], memoryCandidates: [] };
       case "confirm_task":
+        // A member with a share agreeing to it in words ("confirm") counts like their 👍.
+        if (active?.status === "awaiting_confirmations") return this.confirmShare(ctx, active, io);
         return this.confirmMeal(ctx, active, io);
       case "cancel_task":
         if (!active) return { replies: ["There's no plan to cancel."], memoryCandidates: [] };
@@ -360,27 +419,29 @@ export class GroupAgentImpl implements GroupAgent {
     // Real provider (e.g. Grubhub): quote the exact cart, then ask the payer to approve that amount.
     if (order) {
       const real = await this.quoteAndRequestPayment(ctx, task, option, order, io);
-      if (real) return { replies: [real], memoryCandidates };
+      if (real !== null) return { replies: real ? [real] : [], memoryCandidates };
     }
 
     // Money never moves on a chat message: hand the payer an authenticated approval page (spec 4.2 step 10).
+    // The payer is whoever asked for the plan.
+    const payerUserId = active.state.invokedByUserId;
     try {
       const handoff = await this.deps.approvals.createSpendHandoff(ctx, {
         taskId: task.id,
-        payerUserId: ctx.userId,
+        payerUserId,
         summary: order
           ? `Group order at ${option.name}: ${formatMoney(order.totalMinor, order.currency)} total for ${order.lines.length} people`
           : `Group order at ${option.name}, about ${formatMoney(option.pricePerPersonMinor, option.currency)} per person for ${active.state.proposal.respondents} people`,
       });
       const delivered = await io.dmUser(
-        ctx.userId,
+        payerUserId,
         order
           ? `Pay ${formatMoney(order.totalMinor, order.currency)} for the group order at ${option.name}: ${handoff.url}${handoff.sandbox ? " (sandbox test - no real money moves)" : ""}`
           : `Approve the group order at ${option.name} here: ${handoff.url}${handoff.sandbox ? " (sandbox test - no real money moves)" : ""}`,
       );
       task = await this.update(ctx, task, "handed_off", {
         ...task.state,
-        handoff: { approvalId: handoff.approvalId, payerUserId: ctx.userId, sandbox: handoff.sandbox },
+        handoff: { approvalId: handoff.approvalId, payerUserId, sandbox: handoff.sandbox },
       });
       await this.audit(ctx, "spend.handoff_requested", {
         taskId: task.id,
@@ -467,7 +528,8 @@ export class GroupAgentImpl implements GroupAgent {
       });
     }
     if (!lines.length) return null;
-    const payerUserId = ctx.userId;
+    // The person who asked for the order pays, on their own account.
+    const payerUserId = task.state.invokedByUserId;
     const order: GroupOrder = {
       restaurant: option.name,
       currency: option.currency,
@@ -475,6 +537,7 @@ export class GroupAgentImpl implements GroupAgent {
       notIncluded,
       totalMinor: lines.reduce((n, l) => n + l.subtotalMinor, 0),
       payerUserId,
+      payerName: members.find((m) => m.userId === payerUserId)?.displayName ?? null,
       splits: lines
         .filter((l) => l.userId !== payerUserId)
         .map((l) => ({ userId: l.userId, name: l.name, owesMinor: l.subtotalMinor })),
@@ -489,9 +552,10 @@ export class GroupAgentImpl implements GroupAgent {
   }
 
   /**
-   * Quote the real cart (provider total incl. tax/fees; no charge) and propose submit_order through
-   * the gateway — a spend tool, so the gateway asks the payer privately to approve the exact amount.
-   * Returns the group message, or null when the provider has no quotes (test data: old flow).
+   * Quote the real cart on the payer's own account (provider total incl. tax/fees; no charge), then
+   * post the order with everyone's share: each of them 👍s it (or says "confirm") before the payer is
+   * asked to pay. Returns the group message ("" when already sent), or null when the provider has no
+   * quotes (test data: old flow).
    */
   private async quoteAndRequestPayment(
     ctx: TurnContext,
@@ -501,15 +565,30 @@ export class GroupAgentImpl implements GroupAgent {
     io: TurnIO,
   ): Promise<string | null> {
     const quoteTool = this.deps.optionsTool.replace(/__.+$/, "__quote_order");
-    const submitTool = this.deps.optionsTool.replace(/__.+$/, "__submit_order");
     const items = order.lines.flatMap((l) =>
       l.items.map((i) => ({ itemId: i.itemId, quantity: i.quantity })),
     );
-    const q = await this.deps.runtime.invokeTool(ctx, quoteTool, { optionId: option.id, items }, io);
+    const payer = this.nameIn(order, order.payerUserId);
+    const q = await this.deps.runtime.invokeTool(
+      asPayer(ctx, order.payerUserId),
+      quoteTool,
+      { optionId: option.id, items },
+      io,
+    );
     if (q.status === "denied" && q.reasonCode === "tool_unknown") return null;
     if (q.status !== "executed" || !q.result.ok) {
       await this.update(ctx, task, "failed", task.state);
       return `${this.describeOrder(option.name, order, false)}\nI couldn't get a price from ${option.name} right now, so nothing was ordered. Try again in a bit.`;
+    }
+    const failed = ToolErrorSchema.safeParse(q.result.data);
+    if (failed.success && failed.data.error === "account_not_connected") {
+      await this.update(ctx, task, "failed", task.state);
+      // Ask the payer privately to connect it; they then ask the group again.
+      const link = this.deps.accountLink;
+      const asked = link
+        ? await io.dmUser(order.payerUserId, await link.begin(ctx, order.payerUserId))
+        : false;
+      return `${this.describeOrder(option.name, order, false)}\n${payer} needs to connect a Grubhub account before I can order on it. Nothing was ordered.${asked ? ` ${payer}, I texted you how. Once it's connected, ask me again.` : ""}`;
     }
     const quote = ToolQuoteSchema.safeParse(q.result.data); // provider output is untrusted data
     if (!quote.success) return null;
@@ -518,10 +597,11 @@ export class GroupAgentImpl implements GroupAgent {
       return `${this.describeOrder(option.name, order, false)}\n${option.name} didn't give me the final total (tax and fees), so I can't ask anyone to pay yet. Nothing was ordered.`;
     }
     const total = quote.data.totalMinor;
+    const splits = shareSplits(order, total);
     const priced: GroupOrder = {
       ...order,
       totalMinor: total,
-      splits: shareSplits(order, total),
+      splits,
       quote: {
         provider: quote.data.provider,
         cartId: quote.data.cartId,
@@ -531,6 +611,7 @@ export class GroupAgentImpl implements GroupAgent {
         feesMinor: quote.data.feesMinor ?? null,
         tipMinor: quote.data.tipMinor,
       },
+      confirmations: { needed: splits.map((x) => x.userId), confirmed: [] },
       delivery: { platform: ctx.platform, providerConversationId: ctx.providerConversationId },
     };
     await this.audit(ctx, "order.quoted", {
@@ -539,27 +620,101 @@ export class GroupAgentImpl implements GroupAgent {
       provider: quote.data.provider,
     });
 
-    // Spend → the gateway answers needs_approval and the runtime DMs the payer the approval link.
+    // Only the payer has items: nobody else has a share to agree to.
+    if (!splits.length) {
+      task = await this.update(ctx, task, "decided", { ...task.state, order: priced });
+      return `${this.describeOrder(option.name, priced, false)}\n${await this.requestPayment(ctx, task, io)}`;
+    }
+    task = await this.update(ctx, task, "awaiting_confirmations", { ...task.state, order: priced });
+    const who = splits.map((x) => x.name ?? "someone").join(", ");
+    const text = [
+      this.describeOrder(option.name, priced, false),
+      `${who}: 👍 this message to agree to your share (or reply "${this.deps.invocationHint} confirm"). A 👎 cancels the order.`,
+      `Nothing is ordered until everyone agrees and ${payer} approves the total.`,
+    ].join("\n");
+    // Sent here (not returned) so we know its message id: a 👍 on exactly this message agrees.
+    const sent = await io.reply(text);
+    if (sent)
+      await this.update(ctx, task, "awaiting_confirmations", {
+        ...task.state,
+        order: { ...priced, confirmations: { ...priced.confirmations!, messageId: sent.messageId } },
+      });
+    return "";
+  }
+
+  /** One member with a share agreed to it (👍 or "confirm"). Once everyone has, ask the payer to pay. */
+  private async confirmShare(
+    ctx: TurnContext,
+    active: Task,
+    io: TurnIO,
+  ): Promise<{ replies: string[]; memoryCandidates: MemoryCandidate[] }> {
+    const order = active.state.order!;
+    const c = order.confirmations ?? { needed: [], confirmed: [] };
+    const names = (ids: string[]) => ids.map((u) => this.nameIn(order, u)).join(", ");
+    const waitingOn = (confirmed: string[]) => c.needed.filter((u) => !confirmed.includes(u));
+    if (!c.needed.includes(ctx.userId))
+      return {
+        replies: [
+          ctx.userId === order.payerUserId
+            ? `You're paying, so there's nothing for you to agree to. Waiting on ${names(waitingOn(c.confirmed))}.`
+            : "You don't have a share in this order.",
+        ],
+        memoryCandidates: [],
+      };
+    if (c.confirmed.includes(ctx.userId))
+      return {
+        replies: [`You already agreed. Waiting on ${names(waitingOn(c.confirmed))}.`],
+        memoryCandidates: [],
+      };
+    const confirmed = [...c.confirmed, ctx.userId];
+    const task = await this.update(ctx, active, "awaiting_confirmations", {
+      ...active.state,
+      order: { ...order, confirmations: { ...c, confirmed } },
+    });
+    await this.audit(ctx, "order.share_confirmed", {
+      taskId: task.id,
+      confirmed: confirmed.length,
+      needed: c.needed.length,
+    });
+    const waiting = waitingOn(confirmed);
+    if (waiting.length)
+      return {
+        replies: [`${this.nameIn(order, ctx.userId)} is in. Still waiting on ${names(waiting)}.`],
+        memoryCandidates: [],
+      };
+    return { replies: [`Everyone's in. ${await this.requestPayment(ctx, task, io)}`], memoryCandidates: [] };
+  }
+
+  /**
+   * Propose submit_order through the gateway as the payer — a spend tool, so the gateway asks them
+   * privately (the runtime DMs them the approval link) to approve the exact amount.
+   */
+  private async requestPayment(ctx: TurnContext, task: Task, io: TurnIO): Promise<string> {
+    const order = task.state.order!;
+    const submitTool = this.deps.optionsTool.replace(/__.+$/, "__submit_order");
     const s = await this.deps.runtime.invokeTool(
-      ctx,
+      asPayer(ctx, order.payerUserId),
       submitTool,
-      { cartId: quote.data.cartId, approvedTotalMinor: total },
+      { cartId: order.quote!.cartId, approvedTotalMinor: order.totalMinor },
       io,
     );
     if (s.status !== "needs_approval") {
-      await this.update(ctx, task, "failed", { ...task.state, order: priced });
-      return `${this.describeOrder(option.name, priced, false)}\nI couldn't set up the payment, so nothing was ordered.`;
+      await this.update(ctx, task, "failed", task.state);
+      return "I couldn't set up the payment, so nothing was ordered.";
     }
     await this.update(ctx, task, "awaiting_payment", {
       ...task.state,
-      order: { ...priced, approvalId: s.approvalId },
+      order: { ...order, approvalId: s.approvalId },
     });
-    const payer = this.nameIn(priced, priced.payerUserId);
-    return `${this.describeOrder(option.name, priced, false)}\n${payer}, I sent you a private link to approve ${formatMoney(total, priced.currency)}. Nothing is ordered until you do.`;
+    const payer = this.nameIn(order, order.payerUserId);
+    return `${payer}, I sent you a private link to approve ${formatMoney(order.totalMinor, order.currency)}. Nothing is ordered until you do.`;
   }
 
   private nameIn(order: GroupOrder, userId: string): string {
-    return order.lines.find((l) => l.userId === userId)?.name ?? "the payer";
+    const name = order.lines.find((l) => l.userId === userId)?.name;
+    if (name) return name;
+    if (userId === order.payerUserId) return order.payerName ?? "the payer";
+    return "someone";
   }
 
   private describeOrder(restaurant: string, order: GroupOrder, sandbox: boolean): string {
@@ -677,6 +832,20 @@ export class GroupAgentImpl implements GroupAgent {
     const option = p ? task.state.options.find((o) => o.id === p.optionId) : undefined;
     if (task.status === "proposed" && option)
       return `Proposed ${option.name}, about ${formatMoney(option.pricePerPersonMinor, option.currency)} per person (${p!.acceptCount} of ${p!.respondents} agents in).`;
+    const order = task.state.order;
+    if (order) {
+      const money = formatMoney(order.totalMinor, order.currency);
+      const payer = this.nameIn(order, order.payerUserId);
+      if (task.status === "awaiting_confirmations") {
+        const c = order.confirmations;
+        const waiting = (c?.needed ?? []).filter((u) => !c!.confirmed.includes(u));
+        return `Order at ${order.restaurant} (${money}, ${payer} paying) is waiting for ${waiting.map((u) => this.nameIn(order, u)).join(", ")} to agree to their share.`;
+      }
+      if (task.status === "awaiting_payment")
+        return `Order at ${order.restaurant} (${money}) is waiting for ${payer} to approve the payment.`;
+      if (task.status === "ordered")
+        return `Order at ${order.restaurant} is placed; I'm tracking the delivery.`;
+    }
     return `Meal plan is ${task.status}.`;
   }
 

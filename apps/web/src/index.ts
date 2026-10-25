@@ -318,6 +318,13 @@ async function poll() {
         ${groups.length ? html`<p>You're in ${groups.length} group chat${groups.length === 1 ? "" : "s"} with the assistant.</p>` : html`<p class="muted">None yet. Add the assistant to a group chat and mention it.</p>`}
       </div>
       <div class="card">
+        <h2>Ordering food</h2>
+        <p class="small muted">
+          Orders are placed on your own Grubhub account. To connect it, text the assistant "connect grubhub".
+          Your user id: <code>${s.userId}</code>
+        </p>
+      </div>
+      <div class="card">
         <h2>Sign out or revoke</h2>
         <button class="secondary" id="logout">Sign out</button>
         <p class="small muted">
@@ -700,11 +707,12 @@ document.querySelectorAll("[data-revoke]").forEach((b) => b.onclick = async () =
     }
     const money = (m: number | null) => (m === null ? "—" : `$${(m / 100).toFixed(2)}`);
     const q = order.quote;
-    const body = html` <h1>Place the group order</h1>
+    const personal = task.type === "personal_meal";
+    const provider = q.provider === "grubhub" ? "Grubhub" : q.provider;
+    const you = (await c.identity.getUser(s.userId))?.displayName;
+    const body = html` <h1>${personal ? "Place your order" : "Place the group order"}</h1>
       <div class="card">
-        <h2>
-          ${order.restaurant} <span class="pill">${q.provider === "grubhub" ? "Grubhub" : q.provider}</span>
-        </h2>
+        <h2>${order.restaurant} <span class="pill">${provider}</span></h2>
         <table>
           ${order.lines.map(
             (l) =>
@@ -738,8 +746,8 @@ document.querySelectorAll("[data-revoke]").forEach((b) => b.onclick = async () =
           </tr>
         </table>
         <p class="small muted">
-          Paid with the card saved on the ordering account. The order is only placed if the restaurant's total
-          is still exactly ${money(q.totalMinor)}.
+          Paid with the card saved on your own ${provider} account${you ? ` (${you})` : ""}. The order is only
+          placed if the restaurant's total is still exactly ${money(q.totalMinor)}.
         </p>
         ${order.splits.length ? html`<p class="small">Split after: ${order.splits.map((x) => `${x.name ?? "someone"} owes you ${money(x.owesMinor)}`).join(", ")}.</p>` : raw("")}
         <button id="place">Place order · ${money(q.totalMinor)}</button>

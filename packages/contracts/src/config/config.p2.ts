@@ -52,6 +52,11 @@ const schema = z.object({
   GRUBHUB_SESSION_DIR: z.string().default("./.data/grubhub"),
   /** Hard cap per real order, in cents. */
   GRUBHUB_MAX_ORDER_MINOR: int(8000),
+  /**
+   * Actually place Grubhub orders (attach the payer's saved card, then check out). Off until those
+   * calls are verified against a real grubhub.com checkout; until then submit_order fails closed.
+   */
+  GRUBHUB_CHECKOUT_ENABLED: flag(),
 });
 
 export const configSectionP2: ConfigSection<typeof schema> = {

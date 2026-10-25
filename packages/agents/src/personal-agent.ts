@@ -24,6 +24,7 @@ import {
   parseContextFields,
   personalAgentId,
 } from "@campus/contracts";
+import type { AccountLinkFlow } from "./account-link";
 import { formatHistory, personalSystemPrompt } from "./prompts";
 
 // PersonalAgent(userId): identity + authorized context, instantiated on demand (spec 4.1).
@@ -37,6 +38,8 @@ export type PersonalAgentDeps = {
   logger: Logger;
   clock: Clock;
   agentName: string;
+  /** Connecting their own ordering account from this chat (absent with test data). */
+  accountLink?: AccountLinkFlow;
 };
 
 /** Fields a personal agent reads (for itself only) to evaluate meal options. */
@@ -61,6 +64,15 @@ export class PersonalAgentImpl implements PersonalAgent {
     if (ctx.userId !== this.userId || ctx.agent.id !== this.agentId) {
       throw new Error("personal agent invoked for a different principal");
     }
+    // A sign-in to their ordering account is handled without the model and kept out of memory.
+    const linked = input.reaction ? null : await this.deps.accountLink?.handle(ctx, input.text);
+    if (linked)
+      return {
+        replies: [linked],
+        memoryCandidates: [],
+        skipMessageMemory: true,
+        detail: { intent: "account_link" },
+      };
     const principal = { kind: "user" as const, userId: this.userId };
     const dataBlocks: DataBlock[] = [];
     try {

@@ -243,14 +243,15 @@ describe("real P3 memory in P1's pipeline (USE_REAL_MEMORY=true)", () => {
     expect(line(BLAKE.userId).subtotalMinor).toBeLessThanOrEqual(1500);
     expect(line(CASEY.userId).subtotalMinor).toBeLessThanOrEqual(1800);
     expect(task.totalMinor).toBe(task.lines.reduce((n, l) => n + l.subtotalMinor, 0));
-    expect(task.payerUserId).toBe(CASEY.userId);
-    expect(task.splits.map((x) => x.userId).sort()).toEqual([AVERY.userId, BLAKE.userId].sort());
-    expect(groupText).toContain("Casey is paying");
+    // The person who asked (Avery) pays, not whoever confirmed.
+    expect(task.payerUserId).toBe(AVERY.userId);
+    expect(task.splits.map((x) => x.userId).sort()).toEqual([BLAKE.userId, CASEY.userId].sort());
+    expect(groupText).toContain("Avery is paying");
     // Private caps ($15 / $18 exactly) never appear; menu prices like $15.50 may.
     expect(groupText).not.toMatch(/vegetarian|mexican|\$15(?![.\d])|\$18(?![.\d])|budget/i);
     // The payer alone gets the payment link, with the exact total.
     const dm = t.sent.find((m) => m.kind === "dm")!;
-    expect(dm.to).toBe(CASEY.externalId);
+    expect(dm.to).toBe(AVERY.externalId);
     expect(dm.text).toContain(`$${(task.totalMinor / 100).toFixed(2)}`);
   });
 
